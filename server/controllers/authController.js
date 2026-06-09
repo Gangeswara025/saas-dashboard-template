@@ -1,8 +1,18 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const supabase = require('../config/supabase');
+const { v4: uuidv4 } = require('uuid');
+const path = require('path');
 
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+};
+
+const formatAvatarUrl = (avatarPath) => {
+  if (!avatarPath) return avatarPath;
+  if (avatarPath.startsWith('/')) return avatarPath; // legacy local paths
+  if (avatarPath.startsWith('http')) return avatarPath; // external urls
+  return `/api/auth/avatar/${encodeURIComponent(avatarPath)}`;
 };
 
 // @desc    Login user
@@ -27,7 +37,7 @@ const login = async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        avatar: user.avatar,
+        avatar: formatAvatarUrl(user.avatar),
         company: user.company,
         assignedProjects: user.assignedProjects,
       },
@@ -42,7 +52,9 @@ const login = async (req, res) => {
 const getMe = async (req, res) => {
   try {
     const user = await User.findById(req.user._id).populate('assignedProjects', 'name status progress');
-    res.json(user);
+    const userData = user.toObject();
+    userData.avatar = formatAvatarUrl(user.avatar);
+    res.json(userData);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -68,7 +80,13 @@ const createClient = async (req, res) => {
 const getClients = async (req, res) => {
   try {
     const clients = await User.find({ role: 'client' }).populate('assignedProjects', 'name status progress');
-    res.json(clients);
+    // Map avatars for clients
+    const clientsData = clients.map(client => {
+      const clientObj = client.toObject();
+      clientObj.avatar = formatAvatarUrl(client.avatar);
+      return clientObj;
+    });
+    res.json(clientsData);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -85,7 +103,9 @@ const updateClient = async (req, res) => {
       { new: true }
     );
     if (!user) return res.status(404).json({ message: 'Client not found' });
-    res.json(user);
+    const userObj = user.toObject();
+    userObj.avatar = formatAvatarUrl(user.avatar);
+    res.json(userObj);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -105,7 +125,26 @@ const updateProfile = async (req, res) => {
     user.company = company !== undefined ? company : user.company;
 
     if (req.file) {
-      user.avatar = `/uploads/avatars/${req.file.filename}`;
+      const ext = path.extname(req.file.originalname);
+      const fileName = `avatars/${uuidv4()}${ext}`;
+
+      const { data, error } = await supabase.storage
+        .from(process.env.SUPABASE_PROFILE_IMAGES_BUCKET || 'profile-images')
+        .upload(fileName, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: true,
+        });
+
+      if (error) throw new Error(`Supabase upload error: ${error.message}`);
+
+      // Delete old avatar if it exists and is a supabase path
+      if (user.avatar && !user.avatar.startsWith('/') && !user.avatar.startsWith('http')) {
+        await supabase.storage
+          .from(process.env.SUPABASE_PROFILE_IMAGES_BUCKET || 'profile-images')
+          .remove([user.avatar]);
+      }
+
+      user.avatar = fileName;
     }
 
     const updatedUser = await user.save();
@@ -115,7 +154,7 @@ const updateProfile = async (req, res) => {
       name: updatedUser.name,
       email: updatedUser.email,
       role: updatedUser.role,
-      avatar: updatedUser.avatar,
+      avatar: formatAvatarUrl(updatedUser.avatar),
       company: updatedUser.company,
       phone: updatedUser.phone,
       assignedProjects: updatedUser.assignedProjects,
@@ -148,4 +187,23 @@ const updatePassword = async (req, res) => {
   }
 };
 
-module.exports = { login, getMe, createClient, getClients, updateClient, updateProfile, updatePassword };
+// @desc    Get user avatar
+// @route   GET /api/auth/avatar/:path
+const getAvatar = async (req, res) => {
+  try {
+    const avatarPath = req.params.path;
+    if (!avatarPath) return res.status(400).json({ message: 'Path is required' });
+
+    const { data, error } = await supabase.storage
+      .from(process.env.SUPABASE_PROFILE_IMAGES_BUCKET || 'profile-images')
+      .createSignedUrl(avatarPath, 300);
+
+    if (error) return res.status(500).json({ message: error.message });
+    
+    res.redirect(data.signedUrl);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+module.exports = { login, getMe, createClient, getClients, updateClient, updateProfile, updatePassword, getAvatar };

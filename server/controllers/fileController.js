@@ -1,21 +1,13 @@
 const path = require('path');
-const fs = require('fs');
 const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
+const supabase = require('../config/supabase');
 const File = require('../models/File');
 const Activity = require('../models/Activity');
 const Notification = require('../models/Notification');
 const Project = require('../models/Project');
 
-const uploadDir = path.join(__dirname, '../uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${unique}-${file.originalname}`);
-  },
-});
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   const allowed = [
@@ -38,6 +30,13 @@ const getCategory = (mime) => {
   return 'other';
 };
 
+const formatAvatarUrl = (avatarPath) => {
+  if (!avatarPath) return avatarPath;
+  if (avatarPath.startsWith('/')) return avatarPath; 
+  if (avatarPath.startsWith('http')) return avatarPath; 
+  return `/api/auth/avatar/${encodeURIComponent(avatarPath)}`;
+};
+
 // @desc    Get files for a project
 // @route   GET /api/files/project/:projectId
 const getFiles = async (req, res) => {
@@ -45,7 +44,16 @@ const getFiles = async (req, res) => {
     const files = await File.find({ project: req.params.projectId })
       .populate('uploadedBy', 'name avatar')
       .sort({ createdAt: -1 });
-    res.json(files);
+
+    const formattedFiles = files.map(file => {
+      const f = file.toObject();
+      if (f.uploadedBy && f.uploadedBy.avatar) {
+        f.uploadedBy.avatar = formatAvatarUrl(f.uploadedBy.avatar);
+      }
+      return f;
+    });
+
+    res.json(formattedFiles);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -60,15 +68,27 @@ const uploadFile = [
       if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
       const { projectId, description } = req.body;
 
+      const ext = path.extname(req.file.originalname);
+      const fileName = `${uuidv4()}${ext}`;
+
+      const { data, error } = await supabase.storage
+        .from(process.env.SUPABASE_DELIVERABLES_BUCKET || 'deliverables')
+        .upload(fileName, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: false,
+        });
+
+      if (error) throw new Error(`Supabase upload error: ${error.message}`);
+
       const versionCount = await File.countDocuments({
         project: projectId,
         originalName: req.file.originalname,
       });
 
       const fileDoc = await File.create({
-        name: req.file.filename,
+        name: fileName,
         originalName: req.file.originalname,
-        path: req.file.path,
+        path: fileName,
         mimeType: req.file.mimetype,
         size: req.file.size,
         project: projectId,
@@ -100,7 +120,12 @@ const uploadFile = [
       });
 
       const populated = await fileDoc.populate('uploadedBy', 'name avatar');
-      res.status(201).json(populated);
+      const populatedObj = populated.toObject();
+      if (populatedObj.uploadedBy && populatedObj.uploadedBy.avatar) {
+        populatedObj.uploadedBy.avatar = formatAvatarUrl(populatedObj.uploadedBy.avatar);
+      }
+
+      res.status(201).json(populatedObj);
     } catch (error) {
       res.status(500).json({ message: error.message });
     }
@@ -113,7 +138,16 @@ const downloadFile = async (req, res) => {
   try {
     const file = await File.findById(req.params.id);
     if (!file) return res.status(404).json({ message: 'File not found' });
-    res.download(file.path, file.originalName);
+
+    const { data, error } = await supabase.storage
+      .from(process.env.SUPABASE_DELIVERABLES_BUCKET || 'deliverables')
+      .createSignedUrl(file.path, 300, {
+        download: file.originalName,
+      });
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.redirect(data.signedUrl);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -125,7 +159,11 @@ const deleteFile = async (req, res) => {
   try {
     const file = await File.findById(req.params.id);
     if (!file) return res.status(404).json({ message: 'File not found' });
-    if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+
+    await supabase.storage
+      .from(process.env.SUPABASE_DELIVERABLES_BUCKET || 'deliverables')
+      .remove([file.path]);
+
     await file.deleteOne();
     res.json({ message: 'File deleted' });
   } catch (error) {
